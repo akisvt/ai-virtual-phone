@@ -12,6 +12,7 @@ import {
     ChatMessage,
     loadFollowUpSchedule,
     loadChatAppSettings,
+    getMaxToolRounds,
     loadChatSessions,
     saveChatSessions,
     getLatestCharacterStateValues,
@@ -33,6 +34,7 @@ import {
 } from "./settings-storage";
 import { assemblePromptPayload, applyOutputRegex, type LLMMessage, type LLMContentPart } from "./llm-prompt-assembler";
 import { MacroEngine, postProcessTrim } from "./macro-engine";
+import { getStatusRegionConfig, resolveStatusRegionSection, resolveStatusRegionExampleLine, resolveStatusRegionComposition, resolveStatusRegionFullExample } from "./chat-status-region";
 import {
     buildProviderDebugMessages,
     buildProviderRequest,
@@ -715,7 +717,8 @@ async function readSseStream(
         }
     };
     const handleEvent = async (eventText: string) => {
-        rawResponse += `${eventText}\n`;
+        // 原始流只为调试快照保留头部：长输出整条累积会把低内存设备的 WebView 顶爆
+        if (rawResponse.length < 65_536) rawResponse += `${eventText}\n`;
         for (const parsed of sseParser.pushEvent(eventText)) {
             await handleParsed(parsed);
         }
@@ -1060,6 +1063,8 @@ export async function sendLLMToolStreamRequest(
         followUpCount?: number;
         debugSessionId?: string;
         signal?: AbortSignal;
+        /** 单次最大输出 token：按调用覆盖预设值（工坊输出护栏用） */
+        maxTokens?: number;
     },
     callbacks?: ChatCompletionStreamCallbacks,
 ): Promise<LLMToolRequestResult> {
@@ -1067,7 +1072,7 @@ export async function sendLLMToolStreamRequest(
     const pluginPurpose = options?.appId ?? "chat";
     const afterPlugins = await applyChatPluginLlmRequest(preset, messages, pluginPurpose, options?.debugSessionId);
     const effectivePreset = afterPlugins.preset;
-    const request = buildProviderRequest(config, effectivePreset, afterPlugins.messages, { tools, stream: true });
+    const request = buildProviderRequest(config, effectivePreset, afterPlugins.messages, { tools, stream: true, maxTokens: options?.maxTokens });
     publishDebugPromptSnapshot({ request, config, preset: effectivePreset, meta, options, requestKind: "native-tools-stream", tools });
     const requestBodyJson = JSON.stringify(request.body);
     const llmAbort = new AbortController();
@@ -1142,7 +1147,7 @@ export async function sendLLMToolStreamRequest(
             const parsed = parseSseEvents(buffer);
             buffer = parsed.rest;
             for (const event of parsed.events) {
-                rawResponse += `${event}\n`;
+                if (rawResponse.length < 65_536) rawResponse += `${event}\n`;
                 for (const data of sseParser.pushEvent(event)) {
                     await handleParsedDelta(data);
                 }
@@ -1150,7 +1155,7 @@ export async function sendLLMToolStreamRequest(
         }
 
         if (buffer.trim()) {
-            rawResponse += buffer.trim();
+            if (rawResponse.length < 65_536) rawResponse += buffer.trim();
             for (const data of sseParser.pushEvent(buffer)) {
                 await handleParsedDelta(data);
             }
@@ -1442,7 +1447,7 @@ export function flattenCompletionResult(result: ChatCompletionResult): string {
     return result.parts.map(p => stripTextToolDirectives(p.text)).filter(Boolean).join("\n\n");
 }
 
-const MAX_TOOL_ROUNDS = 5;
+// 单条消息工具循环轮数上限：设置项（聊天工具箱），默认 5
 const MAX_NATIVE_EXPANDED_TOOL_PACKAGES = 2;
 
 export function buildChatBilingualInstruction(
@@ -1870,6 +1875,8 @@ export async function buildChatPromptMessages(
     const chatBilingualInstruction = !session.isGroup
         ? buildChatBilingualInstruction(session.bilingualTranslationEnabled !== false, "single", session.bilingualTranslationPrompt)
         : "";
+    // 状态区宏：按会话配置解析（native=原文/off=空/custom=契约）；群聊条目不含宏，不受影响
+    const statusRegionCfg = getStatusRegionConfig(session.id);
     const offlineBilingualInstruction = !session.isGroup
         ? buildOfflineBilingualInstruction(
             session.bilingualTranslationEnabled !== false,
@@ -1913,6 +1920,10 @@ export async function buildChatPromptMessages(
         tools: toolsPrompt,
         customAppRichMediaDirectives,
         chatBilingualInstruction,
+        statusRegionSection: resolveStatusRegionSection(statusRegionCfg),
+        statusRegionExampleLine: resolveStatusRegionExampleLine(statusRegionCfg),
+        statusRegionComposition: resolveStatusRegionComposition(statusRegionCfg),
+        statusRegionFullExample: resolveStatusRegionFullExample(statusRegionCfg),
         offlineBilingualInstruction,
         offlineSummaryTag: preset?.story_summary_tag?.trim() || "summary",
         nativeToolHistory: usesNativeActions,
@@ -2040,7 +2051,8 @@ async function generateNativeChatCompletion(
     const actionContext = { characterId: session.contactId, sessionId: session.id, sourceEngine: "chat" as const, signal: options?.signal };
     const expandableSourceKeys = new Set(enabledTools.filter(tool => !isNativeSingleTool(tool)).map(nativeToolSourceKey));
 
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+    const maxToolRounds = getMaxToolRounds();
+    for (let round = 0; round < maxToolRounds; round += 1) {
         let result: LLMToolRequestResult;
         try {
             result = await sendLLMToolRequest(
@@ -2283,7 +2295,8 @@ export async function generateChatCompletion(
     const meta = { characterName: character.name, userName: userIdentity?.name };
     const actionContext = { characterId: session.contactId, sessionId: session.id, sourceEngine: "chat" as const, signal: options?.signal };
 
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const maxToolRounds = getMaxToolRounds();
+    for (let round = 0; round < maxToolRounds; round++) {
         let filteredOutput: string;
         try {
             filteredOutput = await sendLLMRequest(config, preset, llmMessages, regexes, meta, {
@@ -2449,7 +2462,7 @@ export async function generateChatCompletion(
             }
 
             // Last round — one final call
-            if (round === MAX_TOOL_ROUNDS - 1) {
+            if (round === maxToolRounds - 1) {
                 try {
                     const finalOutput = await sendLLMRequest(config, preset, llmMessages, regexes, meta, {
                         appId: options?.appId ?? "chat",
